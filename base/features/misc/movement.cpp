@@ -14,6 +14,11 @@
 // used: interface declarations
 #include "../../sdk/interfaces/imovehelper.h"
 
+// used: [stl] clamp, min
+#include <algorithm>
+// used: [crt] asinf, atanf
+#include <cmath>
+
 // flags of the local player before prediction began
 static int nPreviousLocalFlags = 0;
 
@@ -51,48 +56,120 @@ void MOVEMENT::OnPostMove(CCSPlayer* pLocal, CUserCmd* pCmd, const bool* pbSendP
 #pragma region movement_main
 void MOVEMENT::BunnyHop(CCSPlayer* pLocal, CUserCmd* pCmd)
 {
-	if (!C::Get<bool>(Vars.bMiscBunnyHop) || CONVAR::sv_autobunnyhopping->GetBool())
-		return;
+       static bool bLastJumped = false;
+       static bool bShouldFake = false;
 
-	// check if the player is able to perform jump in the water
-	if (pLocal->GetWaterJumpTime() <= 0.0f)
-	{
-		// update the random seed
-		MEM::fnRandomSeed(pCmd->iRandomSeed);
+       if (!C::Get<bool>(Vars.bMiscBunnyHop) || CONVAR::sv_autobunnyhopping->GetBool())
+               return;
 
-		// bypass of possible SMAC/VAC server anticheat detection
-		if (static bool bShouldFakeJump = false; bShouldFakeJump)
-		{
-			pCmd->nButtons |= IN_JUMP;
-			bShouldFakeJump = false;
-		}
-		// check is player want to jump
-		else if (pCmd->nButtons & IN_JUMP)
-		{
-			// check is player on the ground
-			if (pLocal->GetFlags() & FL_ONGROUND)
-				// note to fake jump at the next tick
-				bShouldFakeJump = true;
-			// check did random jump chance passed
-			else if (MEM::fnRandomInt(0, 100) <= C::Get<int>(Vars.iMiscBunnyHopChance))
-				pCmd->nButtons &= ~IN_JUMP;
-		}
-	}
+       if (pLocal->GetMoveType() == MOVETYPE_LADDER || pLocal->GetMoveType() == MOVETYPE_NOCLIP)
+               return;
+
+       if (!bLastJumped && bShouldFake)
+       {
+               bShouldFake = false;
+               pCmd->nButtons |= IN_JUMP;
+       }
+       else if (pCmd->nButtons & IN_JUMP)
+       {
+               if (pLocal->GetFlags() & FL_ONGROUND)
+                       bShouldFake = bLastJumped = true;
+               else
+               {
+                       pCmd->nButtons &= ~IN_JUMP;
+                       bLastJumped = false;
+               }
+       }
+       else
+               bShouldFake = bLastJumped = false;
 }
 
 void MOVEMENT::AutoStrafe(CCSPlayer* pLocal, CUserCmd* pCmd)
 {
-	if (!C::Get<bool>(Vars.bMiscAutoStrafe))
-		return;
+       if (!C::Get<bool>(Vars.bMiscAutoStrafe))
+               return;
 
-	// check if the player is in air
-	if (!(pLocal->GetFlags() & FL_ONGROUND))
-	{
-		const float flMaxSideSpeed = CONVAR::cl_sidespeed->GetFloat();
+       if (pLocal->GetMoveType() == MOVETYPE_LADDER || pLocal->GetMoveType() == MOVETYPE_NOCLIP)
+               return;
 
-		// determine strafe side by mouse delta that based on current and previous mouse position
-		pCmd->flSideMove = pCmd->shMouseDeltaX < 0 ? -flMaxSideSpeed : flMaxSideSpeed;
-	}
+       if (pLocal->GetFlags() & FL_ONGROUND)
+               return;
+
+       if (pCmd->nButtons & IN_SPEED)
+               return;
+
+       const bool bHoldingW = (pCmd->nButtons & IN_FORWARD);
+       const bool bHoldingA = (pCmd->nButtons & IN_MOVELEFT);
+       const bool bHoldingS = (pCmd->nButtons & IN_BACK);
+       const bool bHoldingD = (pCmd->nButtons & IN_MOVERIGHT);
+
+       const bool bPressingMove = bHoldingW || bHoldingA || bHoldingS || bHoldingD;
+       if (!bPressingMove)
+               return;
+
+       Vector_t vecVelocity = pLocal->GetVelocity();
+       vecVelocity.z = 0.0f;
+
+       const float flSpeed = vecVelocity.Length();
+       const float flStrafeSmooth = 0.0f;
+       float flIdealStrafe = (flSpeed > 5.0f) ? M_RAD2DEG(std::asinf(15.0f / flSpeed)) : 90.0f;
+       flIdealStrafe *= 1.0f - (flStrafeSmooth * 0.01f);
+
+       if (flIdealStrafe > 90.0f)
+               flIdealStrafe = 90.0f;
+
+       static float flSwitchKey = 1.0f;
+       flSwitchKey *= -1.0f;
+
+       static QAngle_t angBaseView = { };
+       float flWishDir = 0.0f;
+
+       if (bPressingMove)
+       {
+               if (bHoldingW)
+               {
+                       if (bHoldingA)
+                               flWishDir += (90.0f / 2.0f);
+                       else if (bHoldingD)
+                               flWishDir += (-90.0f / 2.0f);
+                       else
+                               flWishDir += 0.0f;
+               }
+               else if (bHoldingS)
+               {
+                       if (bHoldingA)
+                               flWishDir += 135.0f;
+                       else if (bHoldingD)
+                               flWishDir += -135.0f;
+                       else
+                               flWishDir += 180.0f;
+
+                       pCmd->flForwardMove = 0.0f;
+               }
+               else if (bHoldingA)
+                       flWishDir += 90.0f;
+               else if (bHoldingD)
+                       flWishDir += -90.0f;
+
+               angBaseView.y += std::remainderf(flWishDir, 360.0f);
+       }
+
+       const float flSmooth = 1.0f - (0.15f * (flStrafeSmooth * 0.01f));
+       const float flForwardSpeed = CONVAR::cl_forwardspeed->GetFloat();
+       const float flSideSpeed = CONVAR::cl_sidespeed->GetFloat();
+
+       if (flSpeed <= 0.5f)
+       {
+               pCmd->flForwardMove = flForwardSpeed;
+               return;
+       }
+
+       const float flDiff = std::remainderf(angBaseView.y - M_RAD2DEG(std::atan2f(vecVelocity.y, vecVelocity.x)), 360.0f);
+
+       pCmd->flForwardMove = CRT::Clamp(5850.0f / flSpeed, -flForwardSpeed, flForwardSpeed);
+       pCmd->flSideMove = (flDiff > 0.0f) ? -flSideSpeed : flSideSpeed;
+
+       angBaseView.y = std::remainderf(angBaseView.y - flDiff * flSmooth, 360.0f);
 }
 
 void MOVEMENT::EdgeJump(CCSPlayer* pLocal, CUserCmd* pCmd)
